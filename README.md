@@ -1,148 +1,247 @@
 # DeltaWatch
 
-A watchlist that tracks what changed **since you last looked**, not just where prices are
-right now. Verified end-to-end: backend REST + WebSocket API, SQLite persistence,
-mock live market feed, and a React/Zustand frontend that consumes it live.
+## The Problem
 
-Everything in this repo actually runs — it was built and smoke-tested (REST calls,
-WebSocket streaming, `tsc --noEmit`, and a production `vite build`) rather than written
-speculatively.
+Every stock watchlist shows the same thing: a table of prices and a percentage change from yesterday's close. That answers the wrong question.
 
-## Running it
+When you return to your portfolio after two hours, you don't need to know where prices are. You need to know **what moved since you were last here** and **which of those moves actually matters**.
 
-```bash
-# terminal 1
-cd backend && npm install && npm run dev      # http://localhost:4000
+Two specific failures in every standard watchlist:
 
-# terminal 2
-cd frontend && npm install && npm run dev     # http://localhost:5173
-```
+**Flat thresholds lie.** A 2% move is enormous for Apple and unremarkable for Coinbase. A single global alert threshold is either deaf to volatile stocks or noisy on calm ones.
 
-No external services required — Postgres/Redis/TimescaleDB are *not* dependencies here;
-see "Where I simplified" below for why, and what the swap-in path looks like.
+**"Since yesterday's close" isn't "since I looked."** If you check your watchlist five times a day, yesterday's close is stale context for four of those five visits. The meaningful baseline is your own last visit — not the exchange's clock.
 
-## Why this isn't "the obvious watchlist"
-
-A standard watchlist shows Last Traded Price and %-change-from-yesterday's-close. That
-answers "what is the price" but not "what should I actually look at." Two failures follow
-directly from that:
-
-1. **Flat thresholds lie.** A ±3% move is enormous for a sleepy utility stock and
-   unremarkable for a momentum name. A single global threshold is either numb to the
-   volatile stocks or spamming alerts on the quiet ones.
-2. **"Since yesterday's close" isn't "since I looked."** If you check the market five
-   times a day, yesterday's close is stale context for four of those checks. The
-   meaningful reference point is *your own last visit*, not the exchange's clock.
-
-DeltaWatch's whole design follows from fixing those two things.
+DeltaWatch fixes both.
 
 ---
 
-## The decisions I was asked to make
+## What It Does
 
-### What counts as a "meaningful change"
-Not a flat % move. Each symbol gets an **Attention Score (0–100)** combining three
-independent signals, computed server-side per tick (`backend/src/attentionEngine.ts`):
+Every time you open DeltaWatch, it answers three questions — in this order:
 
-- **Volatility-adjusted price delta** — the session move (since *your* checkpoint) expressed
-  as a z-score against that symbol's own recent realized volatility (stdev of returns).
-  "Is this big, for this stock specifically?"
-- **Volume confirmation** — current volume vs. its rolling 20-tick average. A price move
-  with no volume behind it is treated with more suspicion than one that's confirmed.
-- **Catalyst tags** — a recent news/corporate-action flag (e.g. a block deal) adds
-  confidence but, deliberately, can't alone push a score to "High."
+### 1. What changed since I was last here?
+A personal checkpoint stores the exact price of every stock at the moment you last reviewed your watchlist. When you return, every stock is compared against *that* price — not yesterday's close, not today's open. Your delta, not the market's.
 
-No single input can dominate the score — a huge z-score on dead volume, or a big volume
-spike with no price movement, both land in the middle, not "High." Every score ships with
-a plain-English **reason string** (e.g. "Volume 3.1x above average • Block deal: 1.7M
-shares") so "High" is never opaque. This was verified live: in testing, a stock with a
--0.79% move backed by a 3x volume spike scored *higher* than a stock with a larger raw
-move and no confirming signal — the intended behavior, not a lucky accident.
+### 2. What deserves my attention?
+An **Attention Score (0–100)** ranks every stock by how unusual its move is — for that specific stock, confirmed by volume. The highest-scoring stocks float to the top automatically.
 
-### What information to surface
-Ticker, session delta *since your checkpoint* (not since yesterday's close), live price,
-a sparkline with a visible marker for where the price was at your last checkpoint,
-the attention badge, and the reason. Default sort is by Attention Score — what needs
-looking at floats to the top, not alphabetical order (toggle available for "biggest move"
-or A–Z).
+### 3. Why?
+Every score comes with a plain-English explanation. Not just a badge — a reason.
 
-### How state persists across sessions/devices
-The checkpoint (`user_id`, `symbol`, `last_seen_price`, `last_seen_at`, `last_seen_seq`)
-is **server-side**, in `backend/src/db.ts` (SQLite here, Postgres in production) — not
-`localStorage`. That's the only choice that actually satisfies "return later, possibly on
-a different device, and see what changed." The server also decides the checkpoint's price
-and sequence number when you hit "Acknowledge & reset checkpoint" — it never trusts a
-client-supplied price, which matters once you consider multiple tabs/devices resetting
-concurrently.
+> *"NVDA is down 2.6% — unusual for this symbol · Volume 3.1× above average"*
 
-### How stale, delayed, or conflicting data is handled
-- Every tick carries a **monotonic per-symbol sequence number** assigned at the source.
-  Both the backend (`marketFeed.ts::applyTick`) and the frontend (`store.ts::applyTick`)
-  do last-write-wins **by sequence, not by arrival time** — a delayed packet can never
-  clobber a fresher one that happened to arrive first.
-- **Staleness is explicit**: if a symbol hasn't ticked within a threshold window, the grid
-  shows a `stale` marker rather than silently displaying an old number as if it were current.
-- **Reconnection resync**: on every WebSocket (re)connect the server pushes a full snapshot
-  computed from current truth, so a client never has to reason about "what did I miss" —
-  it just gets fresh state. A periodic snapshot (every 4s) is sent as a safety net even to
-  connected clients, catching silently-dead sockets.
-- **Transport fallback**: the frontend (`useMarketSocket.ts`) automatically degrades to
-  REST polling after a couple of failed reconnect attempts, and switches back to the socket
-  transparently once it's healthy — the grid never just goes dark.
+---
 
-### How the system scales for larger watchlists and more users
-The whole pipeline is built around a **pub/sub abstraction** (`TickBus` in
-`marketFeed.ts`) that's implemented with a plain `EventEmitter` here but is interface-
-compatible with Redis Pub/Sub — swapping the implementation is the only change needed to
-run multiple backend instances that all subscribe to the same `market:ticks` channel.
-On top of that, **fan-out is subscription-scoped**: a WebSocket connection only receives
-ticks for symbols on the watchlist it's viewing (`clients` set filtered by `client.symbols`
-in `server.ts`), so cost scales with (users × their own watchlist size), not
-(users × whole market). Per-symbol rolling stats (`SymbolStats`) are fixed-size ring
-buffers, so per-symbol memory is O(1) regardless of how long the market's been running.
+## The Attention Score
 
-### Where I kept things simple vs. added complexity
-Kept simple, on purpose, for a prototype at this scope:
-- **No auth** — a single `demo-user` identity. Real auth is orthogonal to the problem
-  being solved here and would just be a JWT/session layer in front of the same `userId`
-  that's already threaded through every API call.
-- **SQLite instead of Postgres+TimescaleDB**, and **tick history kept in memory** instead
-  of persisted. The schema in `db.ts` only stores what genuinely needs to survive a
-  restart and sync across devices (watchlists, items, checkpoints) — that's a
-  connection-string swap to Postgres, not a redesign. Raw tick history is exactly what a
-  time-series store like TimescaleDB is for; keeping it in-memory here is the right
-  simplification for a prototype, and explicitly *not* the right choice for production
-  (you'd lose sparkline history on restart).
-- **A mock tick generator** instead of a real market data vendor — the interesting,
-  gradeable problem here is the attention/change-detection logic and the state
-  management around it, not a market-data integration.
-- **A single React app instead of a Next.js/NestJS split** with the exact tech named in
-  the original spec — that framework pairing adds SSR/server-actions/dependency-injection
-  machinery that this problem doesn't need, and would have made "does it actually run"
-  much less likely to be true within this scope. The architecture (REST + WS gateway,
-  clean service boundaries, typed contracts) ports to Next/Nest directly if that's a hard
-  requirement later.
+The score combines three signals. No single signal can dominate.
 
-Added complexity, on purpose, where it's load-bearing:
-- The volatility-adjusted attention scoring (a flat threshold would have been much less
-  code, and much less useful).
-- Sequence-numbered, out-of-order-safe tick application on *both* client and server.
-- The pub/sub abstraction, even though it's backed by an EventEmitter today — because the
-  scaling story is a stated requirement, not an afterthought.
+| Signal | Max Points | What It Measures |
+|---|---|---|
+| Volatility-adjusted delta | 55 | How big is this move *for this specific stock* — measured as a z-score against its own recent realized volatility, not a flat percentage |
+| Volume confirmation | 30 | Is unusual trading volume backing the price move? A move on thin volume scores low. A move confirmed by 4× average volume scores high. |
+| Catalyst tag | 15 | Block deal or corporate action in the last 5 minutes |
 
-## Repo layout
+**Score → Band:**
+- 0–32 → `LOW`
+- 33–65 → `MEDIUM`
+- 66–100 → `HIGH`
 
+A stock cannot reach HIGH on price movement alone. Volume must confirm it. This is what separates signal from noise.
+
+---
+
+## Core Features
+
+- **Personal checkpoint** — click "Mark as reviewed" and the server saves the current price of every stock. Come back later on any device and see exactly what moved since that moment.
+- **Delta hero section** — the top of the dashboard shows only stocks that moved since your checkpoint, ranked by magnitude, before you see anything else.
+- **Attention-sorted watchlist** — cards sorted by score, not alphabetically. What needs looking at is always first.
+- **Sparklines with checkpoint marker** — a dashed vertical line marks where the price was when you last checked, so the chart tells the change story visually.
+- **Stock search** — type a company name or ticker to find and add any stock. Supports US and Indian NSE symbols.
+- **Market state labels** — every card shows whether the market is OPEN, CLOSED, PRE-market, or AFTER-hours. You always know what kind of price you're seeing.
+
+---
+
+## Architecture
+Yahoo Finance (real market data, polled every 15s)
+↓
+Backend — fetches quotes, calculates attention scores
+↓
+Redis — distributes ticks across backend instances
+↓
+WebSocket — pushes live updates to connected browsers
+↓
+Frontend — shows delta since checkpoint, sorted by attention
+↓
+PostgreSQL — stores watchlists and checkpoints permanently
+
+---
+
+### Two clean abstractions enable scaling
+
+**`DbApi` interface — `backend/src/db.ts`**
+One interface, two implementations. Set `DATABASE_URL` to switch — no code changes.
+- `SqliteDb` → local development, zero config
+- `PostgresDb` → production, connection pool of 20, concurrent users
+
+**`TickBus` interface — `backend/src/tickBus.ts`**
+One interface, two implementations. Set `REDIS_URL` to switch — no code changes.
+- `InMemoryTickBus` → single process, EventEmitter
+- `RedisTickBus` → multiple backend instances, all sharing one Redis channel. A tick published by Instance A reaches clients connected to Instance B.
+
+---
+
+## How Stale and Delayed Data Is Handled
+
+| Problem | Solution |
+|---|---|
+| Out-of-order ticks | Every tick has a monotonic sequence number. Last-write-wins by sequence, not arrival time. A delayed packet can never overwrite a fresher one — on either client or server. |
+| Stale prices | If a symbol hasn't updated within 35 seconds (Yahoo) or 5 seconds (sim), it is explicitly flagged `stale` in the UI. Old prices are never shown as live. |
+| Silent WebSocket death | The server sends a full snapshot every 20 seconds as a safety net, catching connections that died without a close event. |
+| WebSocket drop | Frontend automatically falls back to REST polling. Switches back to WebSocket transparently when it reconnects. No blank screen, no manual refresh needed. |
+| Provider failure | Each symbol's fetch is independent. One failed Yahoo request doesn't affect any other symbol. |
+| Market closed | Yahoo returns `CLOSED` state. Cards show "Closed" and display the last traded price — never pretending it's a live quote. |
+
+---
+
+## Tech Stack
+
+### Frontend
+- **React** + TypeScript
+- **Zustand** — state management
+- **Tailwind CSS v4** — styling
+- **Vite** — build tool
+- Native WebSocket with automatic REST polling fallback
+
+### Backend
+- **Node.js** + Express + TypeScript
+- **WebSocket** server (`ws`)
+- **Yahoo Finance** via `yahoo-finance2` — real market data, no API key needed
+- `tsx` for development
+
+### Infrastructure
+- **PostgreSQL** on Supabase — watchlists, checkpoints, persists across restarts and devices
+- **Redis** on Upstash — tick pub/sub, enables horizontal scaling
+- **Railway** — backend deployment
+- **Vercel** — frontend deployment
+
+---
+
+## Running It Locally
+
+**Requirements:** Node.js 18+ and npm
+
+**Terminal 1 — Backend**
+```bash
+cd backend
+npm install
+npm run dev
 ```
+
+**Terminal 2 — Frontend**
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open **http://localhost:5173**
+
+Without a `.env` file the backend runs on a simulated feed, clearly labelled in the UI.
+
+---
+
+## Environment Variables
+
+### `backend/.env`
+
+```env
+# "yahoo" for real data | "sim" for simulated (default)
+MARKET_DATA_PROVIDER=yahoo
+
+# PostgreSQL — leave unset to use SQLite locally
+DATABASE_URL=postgresql://user:password@host:5432/dbname?sslmode=require
+
+# Redis — leave unset to use in-memory locally
+REDIS_URL=rediss://default:password@host:6379
+
+PORT=4000
+```
+
+### `frontend/.env.local`
+
+```env
+# Backend URL — leave unset to use http://localhost:4000 locally
+VITE_API_URL=https://your-backend.railway.app
+```
+
+**Full production startup output:**
+[db] Using PostgreSQL
+[tickbus] Using Redis pub/sub — multi-instance scaling enabled
+[market] Using Yahoo Finance provider (real market data)
+[startup] DeltaWatch listening on :4000
+
+---
+
+## Deployment
+
+**Backend → Railway**
+Connect GitHub repo → set root directory to `backend` → add environment variables → deploy. Uses `railway.json` automatically.
+
+**Frontend → Vercel**
+Connect GitHub repo → set root directory to `frontend` → add `VITE_API_URL` → deploy. Uses `vercel.json` automatically.
+
+---
+
+## Project Structure
 backend/
-  src/
-    types.ts            shared domain types
-    db.ts               SQLite: watchlists, items, checkpoints (the durable state)
-    marketFeed.ts        TickBus (pub/sub abstraction) + mock generator + rolling stats
-    attentionEngine.ts   the "what's meaningful" scoring logic
-    server.ts            REST routes + WebSocket gateway
+src/
+server.ts Express + WebSocket gateway
+db.ts DbApi interface — SQLite + PostgreSQL
+tickBus.ts TickBus interface — in-memory + Redis
+marketDataProvider.ts Provider interface — Yahoo Finance + simulated
+marketFeed.ts Symbol registry, feed loop, rolling stats
+attentionEngine.ts Attention score calculation
+types.ts Shared TypeScript types
+.env.example
+railway.json
+
 frontend/
-  src/
-    store.ts             Zustand store: connection state, watchlists, live packets
-    useMarketSocket.ts    WS lifecycle + automatic polling fallback
-    components/           AwayBanner, WatchlistGrid, Sparkline, AttentionBadge, AddSymbol
-```
+src/
+App.tsx
+store.ts Zustand state — watchlists, packets, connection
+useMarketSocket.ts WebSocket lifecycle + polling fallback
+utils.ts Price, percent, time formatters
+components/
+DeltaHero.tsx "Since your last checkpoint" section
+WatchlistGrid.tsx Card grid with sorting
+StockCard.tsx Individual stock card
+OverviewBar.tsx Status bar — connection, stats, checkpoint
+AddSymbol.tsx Search and add with autocomplete
+Sparkline.tsx SVG sparkline with checkpoint marker
+AttentionBadge.tsx LOW / MEDIUM / HIGH badge
+.env.example
+vercel.json
+
+---
+
+## Supported Symbols
+
+Any valid Yahoo Finance symbol works dynamically — no hardcoded lists.
+
+**US:** `AAPL` `TSLA` `NVDA` `MSFT` `GOOGL` `AMZN` `META` `COIN` `PLTR` `AMD`
+
+**Indian NSE:** `TCS.NS` `INFY.NS` `RELIANCE.NS` `HDFCBANK.NS` `WIPRO.NS` `ICICIBANK.NS`
+
+Search by name — type *"Tata"* to find `TCS.NS`, type *"Apple"* to find `AAPL`.
+
+---
+
+## Honest Limitations
+
+- Yahoo Finance is an unofficial API — no guaranteed uptime or SLA
+- Quotes may be 15 minutes delayed depending on the exchange
+- No WebSocket streaming from Yahoo — backend polls every 15 seconds
+- Sparkline history is in-memory — rebuilt from Yahoo's intraday chart on restart
+- Single `demo-user` identity by default — real authentication is one JWT middleware file away, since `userId` is already threaded through every API call and database query
